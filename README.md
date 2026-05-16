@@ -54,8 +54,7 @@ The output is `bin/Release/ImguiPlugin.asi`.
 ## Installation
 
 1. Copy `ImguiPlugin.asi` to your GTA:SA / SA-MP directory (next to `samp.exe`)
-2. Copy `NotoSansThai-Regular.ttf` to the same directory (optional, for better Thai font rendering)
-3. Launch SA-MP — the default chat will be replaced automatically
+2. Launch SA-MP — the default chat will be replaced automatically
 
 ## How It Works
 
