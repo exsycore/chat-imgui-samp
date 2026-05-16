@@ -1,0 +1,9 @@
+[submodule "libs/minhook"]
+	path = libs/minhook
+	url = https://github.com/TsudaKageyu/minhook
+[submodule "libs/samp-api"]
+	path = libs/samp-api
+	url = https://github.com/BlastHackNet/SAMP-API
+[submodule "libs/imgui"]
+	path = libs/imgui
+	url = https://github.com/ocornut/imgui
