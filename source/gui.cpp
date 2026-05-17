@@ -1,4 +1,102 @@
 #include "gui.h"
+#include <ctime>
+#include <cstdio>
+
+static std::string GetCurrentTimestamp() {
+    auto now = std::time(nullptr);
+    auto tm  = std::localtime(&now);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S ", tm);
+    return std::string(buf);
+}
+
+// Reorder color tags: if a {RRGGBB} or {NAME} tag appears mid-word,
+// move it forward to the next whitespace boundary so colors apply to whole words.
+static std::string ReorderColorTags(const std::string& input) {
+    if (input.empty()) return input;
+
+    // Tokenize into segments: text chunks + color tags
+    struct Token { bool isTag; std::string data; };
+    std::vector<Token> tokens;
+    const char* p = input.c_str();
+    std::string buffer;
+    while (*p) {
+        if (*p == '{') {
+            const char* start = p;
+            ImVec4 dummy;
+            if (ChatColor::parse_color_tag(p, dummy)) {
+                if (!buffer.empty()) { tokens.push_back({false, buffer}); buffer.clear(); }
+                tokens.push_back({true, std::string(start, p - start)});
+                continue;
+            }
+        }
+        buffer += *p++;
+    }
+    if (!buffer.empty()) tokens.push_back({false, buffer});
+
+    // For each tag, check if it sits mid-word (prev ends with non-space,
+    // next begins with non-space). If so, move the tag forward to the next
+    // whitespace boundary.
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (!tokens[i].isTag) continue;
+
+        bool prevNonSpace = false;
+        if (i > 0 && !tokens[i-1].isTag && !tokens[i-1].data.empty()) {
+            unsigned char lastByte = static_cast<unsigned char>(tokens[i-1].data.back());
+            if (lastByte != ' ' && lastByte != '\t' && lastByte != '\n' && lastByte != '\r') {
+                prevNonSpace = true;
+            }
+        }
+        if (!prevNonSpace) continue;
+
+        if (i + 1 >= tokens.size() || tokens[i+1].isTag) continue;
+        std::string& next = tokens[i+1].data;
+        if (next.empty()) continue;
+        unsigned char firstByte = static_cast<unsigned char>(next[0]);
+        if (firstByte == ' ' || firstByte == '\t' || firstByte == '\n' || firstByte == '\r') continue;
+
+        unsigned char prevLast = static_cast<unsigned char>(tokens[i-1].data.back());
+        bool prevIsAscii = (prevLast < 0x80);
+
+        size_t splitPos = 0;
+        if (prevIsAscii) {
+            while (splitPos < next.size()) {
+                unsigned char b = static_cast<unsigned char>(next[splitPos]);
+                if (b >= 0x80) break;
+                splitPos++;
+            }
+            while (splitPos > 0) {
+                unsigned char b = static_cast<unsigned char>(next[splitPos - 1]);
+                if (b == ' ' || b == '\t' || b == '\n' || b == '\r') splitPos--;
+                else break;
+            }
+        } else {
+            while (splitPos < next.size()) {
+                unsigned char b = static_cast<unsigned char>(next[splitPos]);
+                if (b == ' ' || b == '\t' || b == '\n' || b == '\r') break;
+                if (b >= 0xC0) {
+                    int extra = 0;
+                    if ((b & 0xE0) == 0xC0) extra = 1;
+                    else if ((b & 0xF0) == 0xE0) extra = 2;
+                    else if ((b & 0xF8) == 0xF0) extra = 3;
+                    splitPos += 1 + extra;
+                } else {
+                    splitPos++;
+                }
+            }
+        }
+        if (splitPos == 0 || splitPos >= next.size()) continue;
+
+        std::string moved = next.substr(0, splitPos);
+        next.erase(0, splitPos);
+        tokens[i-1].data += moved;
+    }
+
+    // Reassemble
+    std::string out;
+    for (auto& t : tokens) out += t.data;
+    return out;
+}
 
 void SAMPChatImGui::Init(HWND hwnd, IDirect3DDevice9* device) {
     if (m_initialized) return;
@@ -97,22 +195,204 @@ void SAMPChatImGui::SnapshotHistory() {
         ChatLine line;
         line.type = entry.m_nType;
         line.prefix = tis620::to_utf8(entry.m_szPrefix);
-        line.text   = tis620::to_utf8(entry.m_szText);
+        line.text   = ReorderColorTags(tis620::to_utf8(entry.m_szText));
         line.prefixColor = ChatColor::from_samp(entry.m_prefixColor);
         line.textColor   = ChatColor::from_samp(entry.m_textColor);
+        if (showTimestamp)
+            line.timestamp = GetCurrentTimestamp();
         m_lines.push_back(std::move(line));
     }
     m_scrollToBot = true;
+}
+
+// Draw text with outline, supporting word-wrap. Updates x/y to end of drawn text.
+static void DrawOutlinedTextWrapped(const char* text, const ImVec4& color,
+                                     float& x, float& y, float wrapStartX, float wrapWidth,
+                                     float lineHeight) {
+    if (!text || text[0] == '\0') return;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImFont* font = const_cast<ImFont*>(ImGui::GetFont());
+    float fontSize = ImGui::GetFontSize();
+    float alpha = color.w;
+    ImU32 col = ImGui::ColorConvertFloat4ToU32(color);
+    ImU32 outline = IM_COL32(0, 0, 0, (int)(alpha * 255));
+
+    int totalLen = (int)strlen(text);
+    int offset = 0;
+
+    while (offset < totalLen) {
+        float remaining = wrapWidth - (x - wrapStartX);
+        if (remaining < 5.f) {
+            x = wrapStartX;
+            y += lineHeight + 2.f;
+            remaining = wrapWidth;
+        }
+
+        // Word-wrap: measure words until we exceed remaining width
+        int fit = 0;
+        float accW = 0.f;
+        const char* s = text + offset;
+        const char* end = text + totalLen;
+
+        while (s < end) {
+            const char* wordStart = s;
+            while (s < end && *s != ' ') s++;
+            const char* wordEnd = s;
+            if (s < end) s++; // include trailing space
+
+            float wordW = ImGui::CalcTextSize(wordStart, s, false, 0.0f).x;
+            if (accW + wordW > remaining && fit > 0) {
+                s = wordStart; // rewind to before this word
+                break;
+            }
+            accW += wordW;
+            fit = (int)(s - (text + offset));
+        }
+
+        if (fit == 0) {
+            // Force at least one UTF-8 character
+            fit = 1;
+            unsigned char c = (unsigned char)text[offset];
+            if ((c & 0xF0) == 0xF0) fit = 4;
+            else if ((c & 0xE0) == 0xE0) fit = 3;
+            else if ((c & 0xC0) == 0xC0) fit = 2;
+        }
+
+        // Draw outline (8 directions)
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                if (dx == 0 && dy == 0) continue;
+                dl->AddText(font, fontSize, ImVec2(x + dx, y + dy), outline,
+                            text + offset, text + offset + fit);
+            }
+        }
+
+        // Draw main text
+        dl->AddText(font, fontSize, ImVec2(x, y), col,
+                    text + offset, text + offset + fit);
+
+        x += ImGui::CalcTextSize(text + offset, text + offset + fit, false, 0.0f).x;
+        offset += fit;
+
+        if (offset < totalLen) {
+            x = wrapStartX;
+            y += lineHeight + 2.f;
+        }
+    }
+}
+
+void SAMPChatImGui::RenderMessageRow(const ChatLine& line, int /*rowIdx*/) {
+    const float alpha = m_alpha;
+
+    float availW = ImGui::GetContentRegionAvail().x;
+    ImVec2 startPos = ImGui::GetCursorScreenPos();
+    float startX = startPos.x;
+    float startY = startPos.y;
+    float currentX = startX;
+    float currentY = startY;
+    float lineHeight = ImGui::GetTextLineHeight();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // Timestamp pill
+    float tsW = 0.f;
+    if (showTimestamp && !line.timestamp.empty()) {
+        ImVec4 tsColor(0.92f, 0.94f, 0.96f, alpha);
+        ImVec2 textSize = ImGui::CalcTextSize(line.timestamp.c_str());
+        float padX = 5.f;
+        float padY = 2.f;
+        float rectW = textSize.x + padX * 2.f;
+        float rectH = textSize.y + padY * 2.f;
+        float rounding = rectH * 0.5f;
+
+        dl->AddRectFilled(
+            ImVec2(startX, startY),
+            ImVec2(startX + rectW, startY + rectH),
+            IM_COL32(0, 0, 0, (int)(alpha * 200)),
+            rounding
+        );
+
+        float textX = startX + padX;
+        float textY = startY + padY;
+        ImU32 outline = IM_COL32(0, 0, 0, (int)(alpha * 255));
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                if (dx == 0 && dy == 0) continue;
+                dl->AddText(ImVec2(textX + dx, textY + dy), outline, line.timestamp.c_str());
+            }
+        }
+        dl->AddText(ImVec2(textX, textY), ImGui::ColorConvertFloat4ToU32(tsColor), line.timestamp.c_str());
+
+        tsW = rectW + 4.f;
+        currentX = startX + tsW;
+    }
+
+    float wrapW = availW - tsW;
+    if (wrapW < 50.f) wrapW = availW;
+    float wrapStartX = startX + tsW;
+
+    // Prefix (player name)
+    if (!line.prefix.empty()) {
+        ImVec4 pc = line.prefixColor; pc.w = alpha;
+        DrawOutlinedTextWrapped(line.prefix.c_str(), pc,
+                                currentX, currentY, wrapStartX, wrapW, lineHeight);
+
+        // Space after prefix
+        float spaceW = ImGui::CalcTextSize(" ").x;
+        if (currentX + spaceW > wrapStartX + wrapW - 2.f) {
+            currentX = wrapStartX;
+            currentY += lineHeight + 2.f;
+        } else {
+            currentX += spaceW;
+        }
+
+        // Colon
+        ImVec4 colonColor(0.75f, 0.78f, 0.85f, alpha);
+        DrawOutlinedTextWrapped(": ", colonColor,
+                                currentX, currentY, wrapStartX, wrapW, lineHeight);
+    }
+
+    // Message text with inline {RRGGBB} color tags
+    const char* p = line.text.c_str();
+    ImVec4 cur = line.textColor; cur.w = alpha;
+    std::string segment;
+
+    auto flush = [&]() {
+        if (!segment.empty()) {
+            DrawOutlinedTextWrapped(segment.c_str(), cur,
+                                    currentX, currentY, wrapStartX, wrapW, lineHeight);
+            segment.clear();
+        }
+    };
+
+    while (*p) {
+        ImVec4 nextColor;
+        if (ChatColor::parse_color_tag(p, nextColor)) {
+            flush();
+            nextColor.w = alpha;
+            cur = nextColor;
+        } else {
+            segment += *p++;
+        }
+    }
+    flush();
+
+    // Advance ImGui cursor to end of this row
+    float totalH = (currentY - startY) + lineHeight + 4.f;
+    ImGui::Dummy(ImVec2(availW, totalH));
 }
 
 void SAMPChatImGui::OnNewEntry(int type, const char* szText, const char* szPrefix,
                                 DWORD textColor, DWORD prefixColor) {
     ChatLine line;
     line.type        = type;
-    line.text        = tis620::to_utf8(szText   ? szText   : "");
+    line.text        = ReorderColorTags(tis620::to_utf8(szText   ? szText   : ""));
     line.prefix      = tis620::to_utf8(szPrefix ? szPrefix : "");
     line.textColor   = ChatColor::from_samp(textColor);
     line.prefixColor = ChatColor::from_samp(prefixColor);
+    if (showTimestamp)
+        line.timestamp = GetCurrentTimestamp();
 
     if ((int)m_lines.size() >= MAX_LINES)
         m_lines.pop_front();
@@ -296,7 +576,7 @@ void SAMPChatImGui::RenderChatWindow() {
     // Render chat lines
     int rowIdx = 0;
     for (const auto& line : m_lines)
-        RenderColoredLine(line, rowIdx++);
+        RenderMessageRow(line, rowIdx++);
 
     // Handle PageUp/PageDown
     if (m_scrollDelta != 0) {
@@ -399,6 +679,8 @@ void SAMPChatImGui::RenderInputWindow() {
             if (tisText[0] == '/') {
                 if (tisText == "/q" || tisText == "/quit") {
                     samp::Commands::Quit("");
+                } else if (tisText == "/timestamp") {
+                    showTimestamp = !showTimestamp;
                 } else {
                     auto* pInput = samp::RefInputBox();
                     if (pInput) {
